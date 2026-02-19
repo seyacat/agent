@@ -92,11 +92,10 @@ Read file: { "action": "read", "file": "..." }
 Apply patch: { "action": "patch", "file": "...", "content": "full new content" }
 Commit: { "action": "commit", "message": "..." }
 
-EXAMPLE TASK "delete file.txt":
-1. First JSON: { "action": "run", "command": "dir" } to check if file exists
-2. After seeing dir output, next JSON: { "action": "run", "command": "del file.txt" } to delete
-3. After deletion, next JSON: { "action": "run", "command": "dir" } to verify deletion
-4. Only after verification, respond with text: "Task completed: file.txt deleted"
+EXAMPLE TASK "create and list files":
+1. First JSON: { "action": "run", "command": "echo Hello > test.txt" } to create a file
+2. After creation, next JSON: { "action": "run", "command": "dir" } to list files and verify
+3. Only after verification, respond with text: "Task completed: test.txt created and verified"
 
 Keep responses concise. The context window is limited; if the conversation grows too long, older messages will be compressed.
 `
