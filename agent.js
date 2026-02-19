@@ -7,8 +7,41 @@ import { exec } from "child_process";
 import dotenv from "dotenv";
 import OpenAI from "openai";
 import simpleGit from "simple-git";
+import { encode } from "gpt-tokenizer";
 
 dotenv.config();
+
+// Token counting and compression
+const MAX_TOKENS = 6000;
+const MAX_MESSAGES = 20;
+
+function countTokens(text) {
+  return encode(text).length;
+}
+
+function countMessageTokens(message) {
+  return countTokens(`${message.role}: ${message.content}`);
+}
+
+function totalTokens() {
+  return messages.reduce((sum, msg) => sum + countMessageTokens(msg), 0);
+}
+
+function compressContext() {
+  let tokens = totalTokens();
+  if (tokens <= MAX_TOKENS && messages.length <= MAX_MESSAGES) {
+    return;
+  }
+  // Keep system message and the most recent messages
+  const system = messages[0];
+  const recent = messages.slice(-MAX_MESSAGES + 1); // +1 because we'll add system back
+  messages = [system, ...recent];
+  // If still over token limit, remove oldest non‑system messages
+  while (totalTokens() > MAX_TOKENS && messages.length > 2) {
+    messages.splice(1, 1); // remove the oldest after system
+  }
+  console.log("🔧 Context compressed.");
+}
 
 const AUTO_APPROVE = process.env.AUTO_APPROVE === "true";
 
@@ -28,23 +61,20 @@ let messages = [
   {
     role: "system",
     content: `
-You are an autonomous coding agent.
+You are an autonomous coding agent that can execute any shell command, read/write files, and commit changes.
 
-When needed respond ONLY in JSON:
+You are working in directory: ${process.cwd()}
 
-Run command:
-{ "action": "run", "command": "..." }
+When you need to perform an action, respond ONLY in JSON:
 
-Read file:
-{ "action": "read", "file": "..." }
-
-Apply patch:
-{ "action": "patch", "file": "...", "content": "full new content" }
-
-Commit:
-{ "action": "commit", "message": "..." }
+Run command: { "action": "run", "command": "..." }
+Read file: { "action": "read", "file": "..." }
+Apply patch: { "action": "patch", "file": "...", "content": "full new content" }
+Commit: { "action": "commit", "message": "..." }
 
 Otherwise respond normally.
+
+Keep responses concise. The context window is limited; if the conversation grows too long, older messages will be compressed.
 `
   }
 ];
@@ -54,11 +84,6 @@ function ask(q) {
 }
 
 function runCommand(command) {
-  const allowed = ["npm", "node", "git", "ls", "cat", "echo", "pwd"];
-  if (!allowed.some(cmd => command.startsWith(cmd))) {
-    return Promise.resolve("❌ Command not allowed.");
-  }
-
   return new Promise(resolve => {
     exec(command, { maxBuffer: 1024 * 1024 }, (err, stdout, stderr) => {
       if (err) resolve(stderr || err.message);
@@ -78,17 +103,20 @@ async function commitChanges(message) {
   return "Committed changes.";
 }
 
-async function loop() {
-  const input = await ask("> ");
-
+async function processInput(input) {
   if (input === "/exit") process.exit(0);
   if (input === "/reset") {
     messages = [messages[0]];
     console.log("🔄 Context reset.");
-    return loop();
+    return;
+  }
+  if (input === "/pwd") {
+    console.log(process.cwd());
+    return;
   }
 
   messages.push({ role: "user", content: input });
+  compressContext();
 
   const stream = await client.chat.completions.create({
     model: "deepseek-chat",
@@ -108,13 +136,14 @@ async function loop() {
   if (!parsed) {
     console.log("\n🤖 " + reply + "\n");
     messages.push({ role: "assistant", content: reply });
-    return loop();
+    compressContext();
+    return;
   }
 
   if (parsed.action === "run") {
     if (!AUTO_APPROVE) {
       const confirm = await ask(`⚠ Run "${parsed.command}"? (y/n): `);
-      if (confirm !== "y") return loop();
+      if (confirm !== "y") return;
     }
 
     const output = await runCommand(parsed.command);
@@ -124,14 +153,14 @@ async function loop() {
       role: "assistant",
       content: `Command output:\n${output}`
     });
-
-    return loop();
+    compressContext();
+    return;
   }
 
   if (parsed.action === "patch") {
     if (!AUTO_APPROVE) {
       const confirm = await ask(`⚠ Patch file "${parsed.file}"? (y/n): `);
-      if (confirm !== "y") return loop();
+      if (confirm !== "y") return;
     }
 
     const result = await applyPatch(parsed.file, parsed.content);
@@ -141,8 +170,8 @@ async function loop() {
       role: "assistant",
       content: result
     });
-
-    return loop();
+    compressContext();
+    return;
   }
 
   if (parsed.action === "commit") {
@@ -153,13 +182,34 @@ async function loop() {
       role: "assistant",
       content: result
     });
-
-    return loop();
+    compressContext();
+    return;
   }
+}
 
+async function loop() {
+  const input = await ask("> ");
+  await processInput(input);
   loop();
 }
 
-console.log("🤖 DeepSeek Autonomous Agent Ready");
-console.log("Commands: /reset /exit");
-loop();
+// Command-line argument handling
+const args = process.argv.slice(2);
+const interactive = args.includes("--interactive");
+const initialInputs = args.filter(arg => arg !== "--interactive").join(" ");
+
+if (initialInputs) {
+  (async () => {
+    await processInput(initialInputs);
+    if (interactive) {
+      console.log("🤖 Entering interactive mode...");
+      loop();
+    } else {
+      process.exit(0);
+    }
+  })();
+} else {
+  console.log("🤖 DeepSeek Autonomous Agent Ready");
+  console.log("Commands: /reset /exit /pwd");
+  loop();
+}
