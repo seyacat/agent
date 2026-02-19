@@ -78,14 +78,25 @@ Operating System: ${osInfo} (${osPlatform})
 Shell: ${shellType}
 ${isWindows ? 'IMPORTANT: You are on Windows. Use Windows commands: "dir" instead of "ls", "del" instead of "rm", "copy" instead of "cp", "move" instead of "mv". Use "cmd.exe" syntax.' : 'IMPORTANT: You are on Unix-like system. Use standard Unix commands.'}
 
-When you need to perform an action, respond ONLY in JSON:
+CRITICAL TASK EXECUTION RULES:
+1. When given a task, you must complete it fully before stopping.
+2. Break complex tasks into multiple steps and execute them sequentially.
+3. During task execution, ALWAYS respond with JSON commands. Do not switch to normal conversation until the task is 100% complete.
+4. After each command execution, assess if the task is complete. If not, immediately provide the next JSON command.
+5. Only return to normal conversation (text responses) when the task is fully completed and verified.
+
+ACTION FORMAT - Respond ONLY in JSON during task execution:
 
 Run command: { "action": "run", "command": "..." }
 Read file: { "action": "read", "file": "..." }
 Apply patch: { "action": "patch", "file": "...", "content": "full new content" }
 Commit: { "action": "commit", "message": "..." }
 
-Otherwise respond normally.
+EXAMPLE TASK "delete file.txt":
+1. First JSON: { "action": "run", "command": "dir" } to check if file exists
+2. After seeing dir output, next JSON: { "action": "run", "command": "del file.txt" } to delete
+3. After deletion, next JSON: { "action": "run", "command": "dir" } to verify deletion
+4. Only after verification, respond with text: "Task completed: file.txt deleted"
 
 Keep responses concise. The context window is limited; if the conversation grows too long, older messages will be compressed.
 `
@@ -137,7 +148,7 @@ async function commitChanges(message) {
   return "Committed changes.";
 }
 
-async function processInput(input) {
+async function processInput(input, maxSteps = 10) {
   if (input === "/exit") process.exit(0);
   if (input === "/reset") {
     messages = [messages[0]];
@@ -152,81 +163,118 @@ async function processInput(input) {
   messages.push({ role: "user", content: input });
   compressContext();
 
-  const stream = await client.chat.completions.create({
-    model: "deepseek-chat",
-    messages,
-    stream: false
-  });
+  let steps = 0;
+  
+  while (steps < maxSteps) {
+    steps++;
+    
+    const stream = await client.chat.completions.create({
+      model: "deepseek-chat",
+      messages,
+      stream: false
+    });
 
-  const reply = stream.choices[0].message.content;
+    const reply = stream.choices[0].message.content;
 
-  let parsed;
-  try {
-    parsed = JSON.parse(reply);
-  } catch {
-    parsed = null;
-  }
+    // Try to extract JSON from markdown code blocks
+    let jsonMatch = reply.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
+    let jsonText = jsonMatch ? jsonMatch[1] : reply;
+    
+    // Also handle case where JSON is not in code blocks but is the entire response
+    let parsed;
+    try {
+      parsed = JSON.parse(jsonText.trim());
+    } catch {
+      parsed = null;
+    }
 
-  if (!parsed) {
+    // Always add the full reply to messages for context
     console.log("\n🤖 " + reply + "\n");
     messages.push({ role: "assistant", content: reply });
-    compressContext();
-    return;
-  }
-
-  if (parsed.action === "run") {
-    if (!AUTO_APPROVE) {
-      const confirm = await ask(`⚠ Run "${parsed.command}"? (y/n): `);
-      if (confirm !== "y") return;
+    
+    if (!parsed) {
+      compressContext();
+      // If the response is not JSON, the LLM might be providing commentary
+      // Continue the loop to see if it provides a JSON command next
+      // But limit to avoid infinite loops on pure conversation
+      if (reply.toLowerCase().includes("task complete") ||
+          reply.toLowerCase().includes("finished") ||
+          reply.toLowerCase().includes("done") ||
+          reply.toLowerCase().includes("completed")) {
+        // Task appears to be complete
+        break;
+      }
+      // Otherwise continue to next iteration
+      continue;
     }
 
-    const result = await runCommand(parsed.command);
-    console.log(result.output);
+    if (parsed.action === "run") {
+      if (!AUTO_APPROVE) {
+        const confirm = await ask(`⚠ Run "${parsed.command}"? (y/n): `);
+        if (confirm !== "y") {
+          // User declined, break out of task continuation
+          break;
+        }
+      }
 
-    if (!result.success) {
-      console.log(`❌ Command failed: ${result.command}`);
-      // Add error context to help AI understand what went wrong
+      const result = await runCommand(parsed.command);
+      console.log(result.output);
+
+      if (!result.success) {
+        console.log(`❌ Command failed: ${result.command}`);
+        messages.push({
+          role: "assistant",
+          content: `Command failed after retries: ${result.command}\nError: ${result.output}\nPlease suggest an alternative approach or fix the command.`
+        });
+      } else {
+        messages.push({
+          role: "assistant",
+          content: `Command executed successfully:\n${result.output}`
+        });
+      }
+      compressContext();
+      
+      // Continue to next step (don't return)
+      continue;
+    }
+
+    if (parsed.action === "patch") {
+      if (!AUTO_APPROVE) {
+        const confirm = await ask(`⚠ Patch file "${parsed.file}"? (y/n): `);
+        if (confirm !== "y") {
+          break;
+        }
+      }
+
+      const result = await applyPatch(parsed.file, parsed.content);
+      console.log(result);
+
       messages.push({
         role: "assistant",
-        content: `Command failed after retries: ${result.command}\nError: ${result.output}\nPlease suggest an alternative approach or fix the command.`
+        content: result
       });
-    } else {
+      compressContext();
+      continue;
+    }
+
+    if (parsed.action === "commit") {
+      const result = await commitChanges(parsed.message);
+      console.log(result);
+
       messages.push({
         role: "assistant",
-        content: `Command executed successfully:\n${result.output}`
+        content: result
       });
+      compressContext();
+      continue;
     }
-    compressContext();
-    return;
+    
+    // Unknown action, break
+    break;
   }
-
-  if (parsed.action === "patch") {
-    if (!AUTO_APPROVE) {
-      const confirm = await ask(`⚠ Patch file "${parsed.file}"? (y/n): `);
-      if (confirm !== "y") return;
-    }
-
-    const result = await applyPatch(parsed.file, parsed.content);
-    console.log(result);
-
-    messages.push({
-      role: "assistant",
-      content: result
-    });
-    compressContext();
-    return;
-  }
-
-  if (parsed.action === "commit") {
-    const result = await commitChanges(parsed.message);
-    console.log(result);
-
-    messages.push({
-      role: "assistant",
-      content: result
-    });
-    compressContext();
-    return;
+  
+  if (steps >= maxSteps) {
+    console.log("⚠ Maximum task steps reached. Returning to interactive mode.");
   }
 }
 
