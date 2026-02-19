@@ -2,6 +2,7 @@
 
 import fs from "fs";
 import path from "path";
+import { fileURLToPath } from "url";
 import readline from "readline";
 import { exec } from "child_process";
 import dotenv from "dotenv";
@@ -9,7 +10,10 @@ import OpenAI from "openai";
 import simpleGit from "simple-git";
 import { encode } from "gpt-tokenizer";
 
-dotenv.config();
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+dotenv.config({ path: path.join(__dirname, '.env') });
 
 // Token counting and compression
 const MAX_TOKENS = 6000;
