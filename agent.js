@@ -61,6 +61,12 @@ const rl = readline.createInterface({
   output: process.stdout
 });
 
+// Detect OS and shell information
+const osPlatform = process.platform;
+const isWindows = osPlatform === 'win32';
+const shellType = process.env.SHELL || (isWindows ? 'cmd.exe' : 'bash');
+const osInfo = isWindows ? 'Windows' : osPlatform === 'darwin' ? 'macOS' : 'Linux';
+
 let messages = [
   {
     role: "system",
@@ -68,6 +74,9 @@ let messages = [
 You are an autonomous coding agent that can execute any shell command, read/write files, and commit changes.
 
 You are working in directory: ${process.cwd()}
+Operating System: ${osInfo} (${osPlatform})
+Shell: ${shellType}
+${isWindows ? 'IMPORTANT: You are on Windows. Use Windows commands: "dir" instead of "ls", "del" instead of "rm", "copy" instead of "cp", "move" instead of "mv". Use "cmd.exe" syntax.' : 'IMPORTANT: You are on Unix-like system. Use standard Unix commands.'}
 
 When you need to perform an action, respond ONLY in JSON:
 
@@ -87,12 +96,33 @@ function ask(q) {
   return new Promise(res => rl.question(q, res));
 }
 
-function runCommand(command) {
-  return new Promise(resolve => {
-    exec(command, { maxBuffer: 1024 * 1024 }, (err, stdout, stderr) => {
-      if (err) resolve(stderr || err.message);
-      else resolve(stdout);
-    });
+function runCommand(command, maxRetries = 3) {
+  return new Promise((resolve, reject) => {
+    const attempt = (retryCount = 0) => {
+      exec(command, { maxBuffer: 1024 * 1024 }, (err, stdout, stderr) => {
+        if (err) {
+          if (retryCount < maxRetries) {
+            console.log(`⚠ Command failed, retrying (${retryCount + 1}/${maxRetries})...`);
+            setTimeout(() => attempt(retryCount + 1), 1000 * (retryCount + 1));
+          } else {
+            resolve({
+              success: false,
+              output: stderr || err.message,
+              error: err,
+              command: command
+            });
+          }
+        } else {
+          resolve({
+            success: true,
+            output: stdout,
+            error: null,
+            command: command
+          });
+        }
+      });
+    };
+    attempt();
   });
 }
 
@@ -150,13 +180,22 @@ async function processInput(input) {
       if (confirm !== "y") return;
     }
 
-    const output = await runCommand(parsed.command);
-    console.log(output);
+    const result = await runCommand(parsed.command);
+    console.log(result.output);
 
-    messages.push({
-      role: "assistant",
-      content: `Command output:\n${output}`
-    });
+    if (!result.success) {
+      console.log(`❌ Command failed: ${result.command}`);
+      // Add error context to help AI understand what went wrong
+      messages.push({
+        role: "assistant",
+        content: `Command failed after retries: ${result.command}\nError: ${result.output}\nPlease suggest an alternative approach or fix the command.`
+      });
+    } else {
+      messages.push({
+        role: "assistant",
+        content: `Command executed successfully:\n${result.output}`
+      });
+    }
     compressContext();
     return;
   }
